@@ -1,51 +1,33 @@
-import socket
+import asyncio
+import websockets
 import pyaudio
+import base64
+import json
 
-# TCP server information
-tcp_port = 48000
 
-# Create a TCP socket
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-# Bind the socket to the address and port
-sock.bind(("", tcp_port))
-
-# Listen for incoming connections
-sock.listen(1)
-
-print("Listening for audio on port {}".format(tcp_port))
-
-# Initialize PyAudio
-p = pyaudio.PyAudio()
-
-# Open a stream for audio playback
-stream = p.open(
-    format=pyaudio.paInt32,  # Assuming INT32 LE samples
-    channels=1,  # Mono audio
-    rate=48000,  # Sample rate
-    output=True,
+audio = pyaudio.PyAudio()
+output_stream = audio.open(
+    format=pyaudio.paInt16, channels=1, rate=24000, output=True, frames_per_buffer=1024
 )
 
-try:
-    while True:
-        # Accept a connection
-        print("Waiting for connection...")
-        conn, addr = sock.accept()
-        print("Connection from", addr)
 
-        try:
-            # Receive and play audio samples
-            while True:
-                data = conn.recv(4096)  # Adjust buffer size as needed
-                if not data:
-                    break
-                stream.write(data)
-        finally:
-            conn.close()
-            print("Connection closed, waiting for new connection...")
-finally:
-    # Clean up
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
-    sock.close()
+async def echo(websocket):
+    print(f"Connected to {websocket.remote_address}")
+    async for message in websocket:
+        # with open("sample.json", "wt") as sample:
+        # sample.write(message)
+        data = json.loads(message)
+        # # Decode the base64 message
+        decoded_data = base64.b64decode(data["audio"])
+        # print(f"Decoded data length: {len(decoded_data)}")
+        # # Play the audio
+        output_stream.write(decoded_data)
+
+
+async def main():
+    print("Listening on ws://0.0.0.0:48000")
+    async with websockets.serve(echo, "0.0.0.0", 48000) as server:
+        await server.serve_forever()
+
+
+asyncio.run(main())

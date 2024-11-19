@@ -3,29 +3,35 @@
 
 #include <math.h>
 #include <freertos/FreeRTOS.h>
-#include <soc/i2s_reg.h>
-#include <driver/i2s_std.h>
-#include <driver/gpio.h>
-#include <nvs_flash.h>
-#include <esp_wifi.h>
-#include <esp_log.h>
-#include <lwip/netdb.h>
-#include <lwip/sockets.h>
-#include <sys/socket.h>
+#include "soc/i2s_reg.h"
+#include "driver/i2s_std.h"
+#include "driver/gpio.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_err.h"
+#include "esp_tls_crypto.h"
+#include "esp_websocket_client.h"
 
 static const char *WIFI_TAG = "WiFi";
 static const char *I2S_TAG = "I2S";
+
+static uint8_t message_buffer[1024];
+static const char MESSAGE_HEADER[] = "{ \"type\": \"input_audio_buffer.append\", \"audio\":\"";
+static const char MESSAGE_FOOTER[] = "\"}";
+static const int MESSAGE_HEADER_LEN = sizeof(MESSAGE_HEADER) - 1;
+static const int MESSAGE_FOOTER_LEN = sizeof(MESSAGE_FOOTER) - 1;
 
 // ============================================================================
 // WiFi
 // ============================================================================
 
-static SemaphoreHandle_t s_wifi_connected;
+static EventGroupHandle_t s_wifi_event_group;
+const int WIFI_CONNECTED_BIT = BIT0;
 
-static void event_handler(void *arg, esp_event_base_t event_base,
-                          int32_t event_id, void *event_data)
+static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
-
     if (event_base == WIFI_EVENT)
     {
         switch (event_id)
@@ -39,6 +45,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                 // Retry connecting
                 esp_wifi_connect();
             }
+            xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             break;
         default:
             break;
@@ -48,14 +55,12 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(WIFI_TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        xSemaphoreGive(s_wifi_connected);
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
 void setup_wifi(void)
 {
-    xSemaphoreTake(s_wifi_connected, 0);
-
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
@@ -63,9 +68,7 @@ void setup_wifi(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
-    s_wifi_connected = xSemaphoreCreateBinary();
     ESP_ERROR_CHECK(esp_netif_init());
-
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
@@ -103,15 +106,57 @@ void setup_wifi(void)
     ESP_LOGI(WIFI_TAG, "wifi_init_sta finished.");
 }
 
+// ----------------------------------------------------------------------------
+// Websocket
+// ----------------------------------------------------------------------------
+
+static EventGroupHandle_t s_websocket_event_group;
+static const int WEBSOCKET_CONNECTED_BIT = BIT0;
+static esp_websocket_client_handle_t ws_client;
+
+static void websocket_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    switch (event_id)
+    {
+    case WEBSOCKET_EVENT_CONNECTED:
+        printf("Connected to websocket\n");
+        xEventGroupSetBits(s_websocket_event_group, WEBSOCKET_CONNECTED_BIT);
+        break;
+    case WEBSOCKET_EVENT_CLOSED:
+    case WEBSOCKET_EVENT_DISCONNECTED:
+        printf("Disconnected from websocket\n");
+        xEventGroupClearBits(s_websocket_event_group, WEBSOCKET_CONNECTED_BIT);
+        break;
+    default:
+        break;
+    }
+}
+
+static esp_err_t websocket_connect()
+{
+    const esp_websocket_client_config_t ws_cfg = {
+        .uri = "ws://192.168.1.102",
+        .port = 48000,
+        .disable_auto_reconnect = false,
+        .reconnect_timeout_ms = 1000,
+    };
+
+    printf("Connecting to websocket\n");
+    ws_client = esp_websocket_client_init(&ws_cfg);
+    esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL);
+    return esp_websocket_client_start(ws_client);
+}
+
 // ============================================================================
 // I2S
 // ============================================================================
 
-typedef int32_t i2s_sample_t;
 static i2s_chan_handle_t tx_chan;
 static i2s_chan_handle_t rx_chan;
 
-const int FREQUENCY = 440; // Hz
+// ----------------------------------------------------------------------------
+// Pin definitions
+// ----------------------------------------------------------------------------
 
 // Amplifier:
 const int PIN_WS = 32;
@@ -121,16 +166,22 @@ const int PIN_DOUT = 25;
 // Microphone:
 const int MIC_PIN_WS = 26;
 const int MIC_PIN_BCLK = 27;
-const int MIC_PIN_DOUT = 14;
+const int MIC_PIN_DOUT = 25;
 
-// Buffers:
-#define SAMPLE_RATE 48000
-#define AUDIO_BUFFER_LEN (SAMPLE_RATE / 100)
-#define AUDIO_BUFFER_SIZE (AUDIO_BUFFER_LEN * sizeof(i2s_sample_t))
-// Currently, the RX and TX buffers are the same size
+// ----------------------------------------------------------------------------
+// Buffers
+// ----------------------------------------------------------------------------
 
-static DMA_ATTR i2s_sample_t rx_buffer[AUDIO_BUFFER_LEN];
-static DMA_ATTR i2s_sample_t tx_buffer[AUDIO_BUFFER_LEN];
+typedef int32_t in_sample;
+typedef int16_t filtered_sample;
+
+#define SAMPLE_RATE 24000
+#define SAMPLE_BUFFER_LEN (SAMPLE_RATE / 100)
+#define SAMPLE_BUFFER_SIZE (SAMPLE_BUFFER_LEN * sizeof(in_sample))
+#define FILTERED_BUFFER_LEN (SAMPLE_BUFFER_LEN * sizeof(filtered_sample))
+
+// Incoming samples have 18-bit data, but comes in 32-bit containers
+DMA_ATTR int32_t in_samples[SAMPLE_BUFFER_LEN];
 
 /*
  * Setup for the MAX98357A amplifier
@@ -158,31 +209,6 @@ void setup_amp(void)
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &i2s_chan_0_cfg));
     ESP_LOGI(I2S_TAG, "I2S initialized");
-}
-
-void send_sinewave()
-{
-    // Make a simple square wave
-    const size_t buf_len = 160;
-    i2s_sample_t *buf = malloc(buf_len * sizeof(i2s_sample_t));
-    for (size_t i = 0; i < buf_len; i++)
-    {
-        buf[i] = (i2s_sample_t)sin(2 * M_PI * FREQUENCY * i / (buf_len * 4)) * INT32_MAX / 512;
-    }
-
-    /* Enable the TX channel */
-    ESP_ERROR_CHECK(i2s_channel_enable(tx_chan));
-    size_t bytes_written;
-    while (1)
-    {
-        /* Write i2s data */
-        if (i2s_channel_write(tx_chan, buf, buf_len * sizeof(i2s_sample_t), &bytes_written, 1000) != ESP_OK)
-        {
-            printf("Write Task: i2s write failed\n");
-        }
-    }
-    free(buf);
-    vTaskDelete(NULL);
 }
 
 /*
@@ -213,7 +239,7 @@ void setup_mic(void)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan, &i2s_chan_1_cfg));
 }
 
-void recording(void *arg)
+void recording()
 {
     const float ALPHA = 0.9980403523506681;
 
@@ -221,40 +247,18 @@ void recording(void *arg)
     size_t rx_bytes;
 
     // The last unfiltered value
-    int32_t last_x_value;
+    int16_t last_x_value;
     // The last filtered value
-    int32_t last_y_value;
+    int16_t last_y_value;
     // Signifies if the last values has been initialized
     bool filter_initialized = false;
 
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (sock < 0)
-    {
-        ESP_LOGE(I2S_TAG, "Failed to create socket");
-        vTaskDelete(NULL);
-    }
-
-    // Packet address is 192.168.1.103
-    struct sockaddr_in receiver_addr = {0};
-    receiver_addr.sin_family = AF_INET;
-    receiver_addr.sin_port = htons(48000);
-    inet_pton(AF_INET, "192.168.1.103", &(receiver_addr.sin_addr));
-
-    // Connect to the server
-    err = connect(sock, (struct sockaddr *)&receiver_addr, sizeof(receiver_addr));
-    if (err < 0)
-    {
-        printf("Failed to connect to server, err: %d\n", err);
-        vTaskDelete(NULL);
-    }
+    memcpy(
+        message_buffer,
+        MESSAGE_HEADER,
+        MESSAGE_HEADER_LEN);
 
     /* Enable the RX channel */
-    err = i2s_channel_enable(tx_chan);
-    if (err != ERR_OK)
-    {
-        ESP_LOGE(I2S_TAG, "Failed to enable TX channel");
-        vTaskDelete(NULL);
-    }
     err = i2s_channel_enable(rx_chan);
     if (err != ERR_OK)
     {
@@ -262,45 +266,67 @@ void recording(void *arg)
         vTaskDelete(NULL);
     }
 
-    // We do one dummy read to make sure the microphone is ready
-    err = i2s_channel_read(rx_chan, rx_buffer, AUDIO_BUFFER_SIZE, &rx_bytes, 1000);
-    if (err != ERR_OK)
-    {
-        ESP_LOGE(I2S_TAG, "Failed to read from RX channel");
-        vTaskDelete(NULL);
-    }
-
+    // We will reuse the same buffer for the filtered samples
+    // As we consume 32-bit samples, and produce 16-bit samples, the two pointers shouldn't trump on each other
+    int16_t *filtered_samples = (int16_t *)in_samples;
     while (1)
     {
+        EventBits_t websocketStatusBits = xEventGroupWaitBits(s_websocket_event_group, WEBSOCKET_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+        // If the websocket was not connected, we need to reinitialize the filter
+        if ((websocketStatusBits & WEBSOCKET_CONNECTED_BIT) == 0)
+        {
+            printf("Websocket was reconnected, reinitializing websocket\n");
+            // Wait for the bit
+            // We will probably skip audio data incoming, so we need to reset the filter
+            filter_initialized = false;
+        }
+
         /* Read i2s data */
-        if (i2s_channel_read(rx_chan, rx_buffer, AUDIO_BUFFER_SIZE, &rx_bytes, 1000) == ESP_OK)
+        if (i2s_channel_read(rx_chan, in_samples, SAMPLE_BUFFER_SIZE, &rx_bytes, 1000) == ESP_OK)
         {
             // If this is the first time we read into the buffer, we initialize the last values
             if (!filter_initialized)
             {
-                last_x_value = rx_buffer[0];
+                last_x_value = (int16_t)(in_samples[0] >> 16);
                 last_y_value = 0;
                 filter_initialized = true;
             }
-            for (int i = 0; i < AUDIO_BUFFER_LEN; i++)
+
+            for (int i = 0; i < SAMPLE_BUFFER_LEN; i++)
             {
-                // We save the current unfiltered value
-                int32_t current_x_value = rx_buffer[i];
-                // We replace it by the filtered value
-                int32_t current_y_value = (int32_t)(ALPHA * (last_y_value + (current_x_value - last_x_value)));
+                // We convert the 18-bit sample to a 16-bit one
+                int16_t current_x_value = (int16_t)(in_samples[i] >> 16);
+                // This is overflow safe
+                int16_t current_y_value = (int16_t)(ALPHA * (last_y_value + (current_x_value - last_x_value)));
+                // We update the last values
                 last_x_value = current_x_value;
                 last_y_value = current_y_value;
-                tx_buffer[i] = current_y_value;
+
+                // We write the filtered value back to the buffer
+                filtered_samples[i] = current_y_value;
             }
 
-            err = i2s_channel_write(tx_chan, tx_buffer, AUDIO_BUFFER_SIZE, &rx_bytes, 1000);
-            if (err != ERR_OK)
-            {
-                printf("Write Task: i2s write failed\n");
-            }
+            // Base64 encode the data
+            size_t written_bytes;
+            esp_crypto_base64_encode(
+                //
+                message_buffer + MESSAGE_HEADER_LEN,
+                sizeof(message_buffer) - MESSAGE_HEADER_LEN - MESSAGE_FOOTER_LEN,
+                &written_bytes,
+                (uint8_t *)filtered_samples,
+                FILTERED_BUFFER_LEN);
+            memcpy(
+                message_buffer + MESSAGE_HEADER_LEN + written_bytes,
+                MESSAGE_FOOTER,
+                MESSAGE_FOOTER_LEN);
 
-            // Send the data to the server
-            send(sock, tx_buffer, AUDIO_BUFFER_SIZE, 0);
+            esp_websocket_client_send_text(
+                ws_client,
+                (char *)message_buffer,
+                MESSAGE_HEADER_LEN + written_bytes + MESSAGE_FOOTER_LEN,
+                portMAX_DELAY);
+
+            // printf("%.*s\n", written_bytes, message_buffer + sizeof(MESSAGE_HEADER));
         }
         else
         {
@@ -308,21 +334,22 @@ void recording(void *arg)
             vTaskDelete(NULL);
         }
     }
-    free(rx_buffer);
     vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
-    s_wifi_connected = xSemaphoreCreateBinary();
+    s_websocket_event_group = xEventGroupCreate();
+    s_wifi_event_group = xEventGroupCreate();
+
     setup_wifi();
     printf("WiFi setup done, waiting for connection\n");
-    xSemaphoreTake(s_wifi_connected, portMAX_DELAY);
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
     printf("Connected to WiFi\n");
+    websocket_connect();
 
-    setup_amp();
+    // setup_amp();
     setup_mic();
 
-    // xTaskCreate(send_sinewave, "send_sinewave", 2048, NULL, 5, NULL);
-    xTaskCreate(recording, "recording", 2048, NULL, 5, NULL);
+    recording();
 }

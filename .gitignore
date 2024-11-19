@@ -2,3 +2,5 @@
 .vscode/
 .venv
 
+managed_components/
+build/
