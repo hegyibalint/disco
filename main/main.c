@@ -2,7 +2,7 @@
 // Amplifier: Adafruit MAX98357A
 
 #include <math.h>
-#include <freertos/FreeRTOS.h>
+#include "freertos/FreeRTOS.h"
 #include "soc/i2s_reg.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
@@ -13,6 +13,7 @@
 #include "esp_err.h"
 #include "esp_tls_crypto.h"
 #include "esp_websocket_client.h"
+#include "cJSON.h"
 
 static const char *WIFI_TAG = "WiFi";
 static const char *I2S_TAG = "I2S";
@@ -114,8 +115,37 @@ static EventGroupHandle_t s_websocket_event_group;
 static const int WEBSOCKET_CONNECTED_BIT = BIT0;
 static esp_websocket_client_handle_t ws_client;
 
+static void websocket_process_data(const char *data, size_t len)
+{
+    // Extract the "type" field from the JSON data incoming
+    cJSON *json = cJSON_Parse(data);
+    cJSON *type = cJSON_GetObjectItem(json, "type");
+    if (type == NULL)
+    {
+        ESP_LOGE("Websocket", "No type field in JSON");
+        return;
+    }
+
+    if (strcmp(type->valuestring, "response.audio.delta") == 0)
+    {
+        cJSON *audio = cJSON_GetObjectItem(json, "audio");
+        if (audio == NULL)
+        {
+            ESP_LOGE("Websocket", "No audio field in JSON");
+            return;
+        }
+        printf("Audio: %s\n", audio->valuestring);
+    }
+    else
+    {
+        ESP_LOGE("Websocket", "Unknown type field in JSON: %s", type->valuestring);
+    }
+}
+
 static void websocket_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
+    esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
+
     switch (event_id)
     {
     case WEBSOCKET_EVENT_CONNECTED:
@@ -123,6 +153,14 @@ static void websocket_event_handler(void *event_handler_arg, esp_event_base_t ev
         xEventGroupSetBits(s_websocket_event_group, WEBSOCKET_CONNECTED_BIT);
         break;
     case WEBSOCKET_EVENT_CLOSED:
+    case WEBSOCKET_EVENT_DATA:
+        ESP_LOGI("websocket", "WEBSOCKET_EVENT_DATA");
+        ESP_LOGI("websocket", "Received opcode=%d", data->op_code);
+        if (data->op_code == 0x01)
+        {
+            websocket_process_data(data->data_ptr, data->data_len);
+        }
+        break;
     case WEBSOCKET_EVENT_DISCONNECTED:
         printf("Disconnected from websocket\n");
         xEventGroupClearBits(s_websocket_event_group, WEBSOCKET_CONNECTED_BIT);
@@ -143,6 +181,7 @@ static esp_err_t websocket_connect()
 
     printf("Connecting to websocket\n");
     ws_client = esp_websocket_client_init(&ws_cfg);
+    esp_websocket_client_append_header(ws_client, AUTH_HEADER_VALUE);
     esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL);
     return esp_websocket_client_start(ws_client);
 }
@@ -325,8 +364,6 @@ void recording()
                 (char *)message_buffer,
                 MESSAGE_HEADER_LEN + written_bytes + MESSAGE_FOOTER_LEN,
                 portMAX_DELAY);
-
-            // printf("%.*s\n", written_bytes, message_buffer + sizeof(MESSAGE_HEADER));
         }
         else
         {
@@ -348,7 +385,7 @@ void app_main(void)
     printf("Connected to WiFi\n");
     websocket_connect();
 
-    // setup_amp();
+    setup_amp();
     setup_mic();
 
     recording();

@@ -4,6 +4,32 @@ import pyaudio
 import base64
 import json
 
+start_msg = """{
+    "event_id": "event_1234",
+    "type": "session.created",
+    "session": {
+        "id": "sess_001",
+        "object": "realtime.session",
+        "model": "gpt-4o-realtime-preview-2024-10-01",
+        "modalities": ["text", "audio"],
+        "instructions": "",
+        "voice": "alloy",
+        "input_audio_format": "pcm16",
+        "output_audio_format": "pcm16",
+        "input_audio_transcription": null,
+        "turn_detection": {
+            "type": "server_vad",
+            "threshold": 0.5,
+            "prefix_padding_ms": 300,
+            "silence_duration_ms": 200
+        },
+        "tools": [],
+        "tool_choice": "auto",
+        "temperature": 0.8,
+        "max_response_output_tokens": null
+    }
+}"""
+
 
 audio = pyaudio.PyAudio()
 output_stream = audio.open(
@@ -13,6 +39,7 @@ output_stream = audio.open(
 
 async def echo(websocket):
     print(f"Connected to {websocket.remote_address}")
+    await websocket.send(start_msg)
     async for message in websocket:
         # with open("sample.json", "wt") as sample:
         # sample.write(message)
